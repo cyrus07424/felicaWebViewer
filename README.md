@@ -41,6 +41,8 @@ If this variable is not set, GTM tags are not included.
 - カード識別情報（IDm / PMm / システムコード）
 - 追加情報（カードモード、利用可能システムコード）
 - 交通系履歴（サービスコード `090F`、最大20件）
+- 学生証情報（Common Area `FE00` のサービスコード `1A8B` から学籍番号候補/日付候補）
+- その他FeliCaカード向けの追加サービスダンプ（Search Service Code + 読み取り可能サービスの先頭ブロック）
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
