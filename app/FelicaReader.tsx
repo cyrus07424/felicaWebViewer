@@ -3,15 +3,29 @@
 import { useState, useCallback, useRef } from 'react';
 import { RCS380, ReceivedPacket } from 'rc_s380_driver';
 
-// FeliCa 212kbps RF settings (TX: F212, RX: F212)
-const FELICA_RF = Uint8Array.of(0x01, 0x01);
-// FeliCa protocol settings (initial guard time, ADD_CRC | CHECK_CRC)
-const FELICA_PROTOCOL = Uint8Array.of(0x01, 0x00, 0x02, 0x07);
+// FeliCa 212kbps RF settings (TX: F212, RX: F212, SEND=0x0f, RECV=0x01)
+const FELICA_RF = Uint8Array.of(0x01, 0x01, 0x0f, 0x01);
+// InSetProtocol option for Type-F polling
+const FELICA_PROTOCOL = Uint8Array.of(0x00, 0x18);
 
 // Polling interval (ms)
 const POLL_INTERVAL_MS = 300;
 // Polling timeout (s)
 const POLL_TIMEOUT_S = 0.5;
+// Polling command variants for RC-S380 / stack differences.
+// social-robotics-lab/card-reader-for-RC-S380 の方針を参考に、
+// system code を複数試して実機差分を吸収する。
+const POLLING_COMMANDS = [
+  // Any system code
+  Uint8Array.of(0x06, 0x00, 0xff, 0xff, 0x01, 0x00),
+  Uint8Array.of(0x00, 0xff, 0xff, 0x01, 0x00),
+  // Common Area (nfcpy sample style)
+  Uint8Array.of(0x06, 0x00, 0xfe, 0x00, 0x01, 0x00),
+  Uint8Array.of(0x00, 0xfe, 0x00, 0x01, 0x00),
+  // Transit IC cards (Suica / PASMO etc.)
+  Uint8Array.of(0x06, 0x00, 0x88, 0xb4, 0x01, 0x00),
+  Uint8Array.of(0x00, 0x88, 0xb4, 0x01, 0x00),
+];
 
 type ConnectionStatus =
   | 'disconnected'
@@ -23,6 +37,8 @@ type CardInfo = {
   idm: string;
   pmm: string;
   systemCode: string;
+  cardMode?: string;
+  availableSystemCodes?: string[];
   detectedAt: Date;
 };
 
@@ -65,12 +81,104 @@ function identifySystemCode(code: string): string {
   return map[code] ?? '不明なシステム';
 }
 
+function parseHexBytes(hex: string): Uint8Array {
+  const tokens = hex.split(' ').filter(Boolean);
+  return Uint8Array.from(tokens.map((token) => Number.parseInt(token, 16)));
+}
+
+function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findFelicaPayload(
+  data: Uint8Array,
+  responseCode: number,
+  idm: Uint8Array
+): Uint8Array | null {
+  for (let i = 0; i <= data.length - (1 + idm.length); i += 1) {
+    if (data[i] !== responseCode) {
+      continue;
+    }
+    const candidateIdm = data.slice(i + 1, i + 1 + idm.length);
+    if (equalBytes(candidateIdm, idm)) {
+      return data.slice(i);
+    }
+  }
+  return null;
+}
+
+function parseCardMode(mode: number): string {
+  const modeMap: Record<number, string> = {
+    0x00: '通常モード',
+    0x01: '認証モード',
+  };
+  const label = modeMap[mode] ?? '不明';
+  return `0x${mode.toString(16).padStart(2, '0').toUpperCase()} (${label})`;
+}
+
+function parsePollingResponse(data: Uint8Array): CardInfo | null {
+  // RC-S380 InCommRF wrapped response:
+  // [0xD7, 0x05, status, ..., pollingResponse]
+  if (data.length >= 17 && data[0] === 0xd7 && data[1] === 0x05) {
+    if (data[2] !== 0x00) {
+      return null;
+    }
+    if (data.length >= 25 && data[8] === 0x01) {
+      const idm = data.slice(9, 17);
+      const pmm = data.slice(17, 25);
+      const systemCode = data.length >= 27 ? data.slice(25, 27) : null;
+
+      return {
+        idm: toHex(idm),
+        pmm: toHex(pmm),
+        systemCode: systemCode ? toHex(systemCode) : '不明',
+        detectedAt: new Date(),
+      };
+    }
+  }
+
+  // Supported forms:
+  // [0x01, IDm(8), PMm(8), systemCode(2)]
+  // [len(1), 0x01, IDm(8), PMm(8), systemCode(2)]
+  const pollingResponse =
+    data.length >= 17 && data[0] === 0x01
+      ? data
+      : data.length >= 18 && data[1] === 0x01
+      ? data.slice(1)
+      : null;
+
+  if (!pollingResponse || pollingResponse.length < 17) {
+    return null;
+  }
+
+  const idm = pollingResponse.slice(1, 9);
+  const pmm = pollingResponse.slice(9, 17);
+  const systemCode =
+    pollingResponse.length >= 19 ? pollingResponse.slice(17, 19) : null;
+
+  return {
+    idm: toHex(idm),
+    pmm: toHex(pmm),
+    systemCode: systemCode ? toHex(systemCode) : '不明',
+    detectedAt: new Date(),
+  };
+}
+
 export default function FelicaReader() {
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
   const [error, setError] = useState<string | null>(null);
   const [card, setCard] = useState<CardInfo | null>(null);
   const rcs380Ref = useRef<RCS380 | null>(null);
   const scanningRef = useRef(false);
+  const lastDetectedIdmRef = useRef<string | null>(null);
 
   const shutdownDevice = useCallback(async (rcs380: RCS380) => {
     let disconnectError: unknown = null;
@@ -94,31 +202,92 @@ export default function FelicaReader() {
     setStatus('scanning');
 
     while (scanningRef.current) {
-      try {
-        // FeliCa polling command: [len, 0x00, sysHigh, sysLow, requestCode, timeSlot]
-        // requestCode=0x01 → response includes system code
-        const pollingCmd = Uint8Array.of(0x06, 0x00, 0xff, 0xff, 0x01, 0x00);
-        const result: ReceivedPacket = await rcs380.inCommRf(
-          pollingCmd,
-          POLL_TIMEOUT_S
-        );
+      let detectedCard: CardInfo | null = null;
 
-        const data = result.data;
-        // Polling response: [len(1), 0x01(1), IDm(8), PMm(8), systemCode(2)]
-        if (data.length >= 18 && data[1] === 0x01) {
-          const idm = data.slice(2, 10);
-          const pmm = data.slice(10, 18);
-          const systemCode = data.length >= 20 ? data.slice(18, 20) : null;
+      for (const pollingCmd of POLLING_COMMANDS) {
+        try {
+          const result: ReceivedPacket = await rcs380.inCommRf(
+            pollingCmd,
+            POLL_TIMEOUT_S
+          );
+          detectedCard = parsePollingResponse(result.data);
+          if (detectedCard) {
+            break;
+          }
+        } catch {
+          // Try next polling variant.
+        }
+      }
+
+      if (detectedCard) {
+        const isNewCard = lastDetectedIdmRef.current !== detectedCard.idm;
+        lastDetectedIdmRef.current = detectedCard.idm;
+
+        if (isNewCard) {
+          const idmBytes = parseHexBytes(detectedCard.idm);
+          let cardMode: string | undefined;
+          let availableSystemCodes: string[] | undefined;
+
+          try {
+            const modeRequest = Uint8Array.of(0x04, ...idmBytes);
+            const modeResult = await rcs380.inCommRf(modeRequest, POLL_TIMEOUT_S);
+            const modePayload = findFelicaPayload(modeResult.data, 0x05, idmBytes);
+            if (modePayload && modePayload.length >= 10) {
+              cardMode = parseCardMode(modePayload[9]);
+            }
+          } catch {
+            // Keep polling even when optional details are unavailable.
+          }
+
+          try {
+            const systemCodeRequest = Uint8Array.of(0x0c, ...idmBytes);
+            const systemCodeResult = await rcs380.inCommRf(
+              systemCodeRequest,
+              POLL_TIMEOUT_S
+            );
+            const systemCodePayload = findFelicaPayload(
+              systemCodeResult.data,
+              0x0d,
+              idmBytes
+            );
+            if (systemCodePayload && systemCodePayload.length >= 10) {
+              const count = systemCodePayload[9];
+              const codes: string[] = [];
+              for (let i = 0; i < count; i += 1) {
+                const offset = 10 + i * 2;
+                if (offset + 1 < systemCodePayload.length) {
+                  codes.push(
+                    toHex(Uint8Array.of(systemCodePayload[offset], systemCodePayload[offset + 1]))
+                  );
+                }
+              }
+              if (codes.length > 0) {
+                availableSystemCodes = codes;
+              }
+            }
+          } catch {
+            // Keep polling even when optional details are unavailable.
+          }
 
           setCard({
-            idm: toHex(idm),
-            pmm: toHex(pmm),
-            systemCode: systemCode ? toHex(systemCode) : '不明',
+            ...detectedCard,
+            cardMode,
+            availableSystemCodes,
             detectedAt: new Date(),
           });
+        } else {
+          setCard((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  detectedAt: new Date(),
+                }
+              : detectedCard
+          );
         }
-      } catch {
+      } else {
         // Timeout or no card — clear card display and keep polling
+        lastDetectedIdmRef.current = null;
         setCard(null);
       }
 
@@ -134,6 +303,7 @@ export default function FelicaReader() {
       setStatus('connecting');
       setError(null);
       setCard(null);
+      lastDetectedIdmRef.current = null;
 
       const rcs380 = await RCS380.connect();
       connectedReader = rcs380;
@@ -172,6 +342,7 @@ export default function FelicaReader() {
       setStatus('disconnected');
       setCard(null);
       setError(null);
+      lastDetectedIdmRef.current = null;
       return;
     }
 
@@ -180,6 +351,7 @@ export default function FelicaReader() {
       setStatus('disconnected');
       setCard(null);
       setError(null);
+      lastDetectedIdmRef.current = null;
     } catch (err) {
       setStatus('error');
       setError(toDisplayError(getErrorMessage(err)));
@@ -323,6 +495,15 @@ export default function FelicaReader() {
                 value={card.systemCode}
                 note={identifySystemCode(card.systemCode)}
               />
+              {card.cardMode && (
+                <CardField label="カードモード" value={card.cardMode} />
+              )}
+              {card.availableSystemCodes && card.availableSystemCodes.length > 0 && (
+                <CardField
+                  label="利用可能システムコード"
+                  value={card.availableSystemCodes.join(' / ')}
+                />
+              )}
             </div>
           </section>
         )}
