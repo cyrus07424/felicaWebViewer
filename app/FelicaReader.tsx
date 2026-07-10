@@ -24,7 +24,8 @@ const TYPE_A_PROTOCOL = Uint8Array.of(
 
 // Polling interval (ms)
 const POLL_INTERVAL_MS = 300;
-const MODE_SWITCH_MISS_THRESHOLD = 3;
+const FELICA_TO_TYPEA_MISS_THRESHOLD = 1;
+const TYPEA_TO_FELICA_MISS_THRESHOLD = 8;
 // Polling timeout (s)
 const POLL_TIMEOUT_S = 0.5;
 // Polling command variants for RC-S380 / stack differences.
@@ -493,11 +494,15 @@ async function typeAAnticollision(
 async function detectTypeACard(rcs380: RCS380): Promise<CardInfo | null> {
   let reqaPayload: Uint8Array | null = null;
   let reqaRaw: Uint8Array | null = null;
+  let typeASeen = false;
   for (const reqCode of [0x26, 0x52]) {
     try {
       const reqa = await rcs380.inCommRf(Uint8Array.of(reqCode), POLL_TIMEOUT_S);
       reqaRaw = reqa.data;
       reqaPayload = unwrapInCommRfData(reqa.data);
+      if (reqaPayload && reqaPayload.length > 0) {
+        typeASeen = true;
+      }
       if (reqaPayload && reqaPayload.length >= 2) {
         break;
       }
@@ -505,7 +510,7 @@ async function detectTypeACard(rcs380: RCS380): Promise<CardInfo | null> {
       // Try next request command.
     }
   }
-  if (!reqaPayload || reqaPayload.length < 2) {
+  if (!typeASeen && (!reqaPayload || reqaPayload.length < 2)) {
     return null;
   }
   const atqa = reqaRaw ? parseTypeAAtqa(reqaRaw) : null;
@@ -645,7 +650,7 @@ export default function FelicaReader() {
 
       if (!detectedCard && scanMode === 'felica') {
         felicaMisses += 1;
-        if (felicaMisses >= MODE_SWITCH_MISS_THRESHOLD) {
+        if (felicaMisses >= FELICA_TO_TYPEA_MISS_THRESHOLD) {
           try {
             await rcs380.sendInPreparationCommands(TYPE_A_RF, TYPE_A_PROTOCOL);
             scanMode = 'typeA';
@@ -656,7 +661,7 @@ export default function FelicaReader() {
         }
       } else if (!detectedCard && scanMode === 'typeA') {
         typeAMisses += 1;
-        if (typeAMisses >= MODE_SWITCH_MISS_THRESHOLD) {
+        if (typeAMisses >= TYPEA_TO_FELICA_MISS_THRESHOLD) {
           try {
             await rcs380.sendInPreparationCommands(FELICA_RF, FELICA_PROTOCOL);
             scanMode = 'felica';
