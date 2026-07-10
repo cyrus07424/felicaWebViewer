@@ -39,7 +39,20 @@ type CardInfo = {
   systemCode: string;
   cardMode?: string;
   availableSystemCodes?: string[];
+  transitHistory?: TransitHistoryEntry[];
   detectedAt: Date;
+};
+
+type TransitHistoryEntry = {
+  index: number;
+  raw: string;
+  date: string;
+  terminalCode: string;
+  processCode: string;
+  inStation: string;
+  outStation: string;
+  balance: number;
+  sequence: number;
 };
 
 function getErrorMessage(err: unknown): string {
@@ -122,6 +135,76 @@ function parseCardMode(mode: number): string {
   };
   const label = modeMap[mode] ?? '不明';
   return `0x${mode.toString(16).padStart(2, '0').toUpperCase()} (${label})`;
+}
+
+function parseTransitHistoryBlock(
+  block: Uint8Array,
+  index: number
+): TransitHistoryEntry {
+  const year = ((block[4] & 0xfe) >> 1) + 2000;
+  const month = ((block[4] & 0x01) << 3) | ((block[5] & 0xe0) >> 5);
+  const day = block[5] & 0x1f;
+  const date = `${year}-${month.toString().padStart(2, '0')}-${day
+    .toString()
+    .padStart(2, '0')}`;
+  const balance = block[10] | (block[11] << 8);
+  const sequence = block[12] | (block[13] << 8);
+  const inStation = `${block[6].toString(16).padStart(2, '0').toUpperCase()}-${block[7]
+    .toString(16)
+    .padStart(2, '0')
+    .toUpperCase()}`;
+  const outStation = `${block[8].toString(16).padStart(2, '0').toUpperCase()}-${block[9]
+    .toString(16)
+    .padStart(2, '0')
+    .toUpperCase()}`;
+
+  return {
+    index,
+    raw: toHex(block),
+    date,
+    terminalCode: `0x${block[0].toString(16).padStart(2, '0').toUpperCase()}`,
+    processCode: `0x${block[1].toString(16).padStart(2, '0').toUpperCase()}`,
+    inStation,
+    outStation,
+    balance,
+    sequence,
+  };
+}
+
+async function readTransitHistory(
+  rcs380: RCS380,
+  idmBytes: Uint8Array
+): Promise<TransitHistoryEntry[]> {
+  const history: TransitHistoryEntry[] = [];
+
+  for (let blockNumber = 0; blockNumber < 20; blockNumber += 1) {
+    const cmd = Uint8Array.of(
+      0x10,
+      0x06,
+      ...idmBytes,
+      0x01,
+      0x0f,
+      0x09,
+      0x01,
+      0x80,
+      blockNumber
+    );
+    const result = await rcs380.inCommRf(cmd, POLL_TIMEOUT_S);
+    const payload = findFelicaPayload(result.data, 0x07, idmBytes);
+    if (!payload || payload.length < 28) {
+      break;
+    }
+
+    // Status flag1 / flag2
+    if (payload[9] !== 0x00 || payload[10] !== 0x00) {
+      break;
+    }
+
+    const blockData = payload.slice(12, 28);
+    history.push(parseTransitHistoryBlock(blockData, blockNumber));
+  }
+
+  return history;
 }
 
 function parsePollingResponse(data: Uint8Array): CardInfo | null {
@@ -227,6 +310,7 @@ export default function FelicaReader() {
           const idmBytes = parseHexBytes(detectedCard.idm);
           let cardMode: string | undefined;
           let availableSystemCodes: string[] | undefined;
+          let transitHistory: TransitHistoryEntry[] | undefined;
 
           try {
             const modeRequest = Uint8Array.of(0x04, ...idmBytes);
@@ -269,10 +353,20 @@ export default function FelicaReader() {
             // Keep polling even when optional details are unavailable.
           }
 
+          try {
+            const history = await readTransitHistory(rcs380, idmBytes);
+            if (history.length > 0) {
+              transitHistory = history;
+            }
+          } catch {
+            // Keep polling even when optional details are unavailable.
+          }
+
           setCard({
             ...detectedCard,
             cardMode,
             availableSystemCodes,
+            transitHistory,
             detectedAt: new Date(),
           });
         } else {
@@ -503,6 +597,33 @@ export default function FelicaReader() {
                   label="利用可能システムコード"
                   value={card.availableSystemCodes.join(' / ')}
                 />
+              )}
+              {card.transitHistory && card.transitHistory.length > 0 && (
+                <div className="rounded-xl bg-slate-900/60 border border-slate-700 px-4 py-3 space-y-2">
+                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wide">
+                    交通系履歴（サービスコード 090F）
+                  </p>
+                  <div className="space-y-2 text-sm">
+                    {card.transitHistory.map((entry) => (
+                      <div
+                        key={entry.index}
+                        className="rounded-lg bg-slate-800/60 border border-slate-700 px-3 py-2 space-y-1"
+                      >
+                        <p className="text-slate-200 font-semibold">
+                          #{entry.index + 1} {entry.date} / 残額 {entry.balance} 円
+                        </p>
+                        <p className="text-slate-400 text-xs">
+                          端末 {entry.terminalCode} / 処理 {entry.processCode} / 入場{' '}
+                          {entry.inStation} / 出場 {entry.outStation} / 連番{' '}
+                          {entry.sequence}
+                        </p>
+                        <p className="text-slate-500 text-xs font-mono break-all">
+                          {entry.raw}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
           </section>

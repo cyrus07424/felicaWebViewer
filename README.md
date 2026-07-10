@@ -36,6 +36,12 @@ If this variable is not set, GTM tags are not included.
 2. RC-S380 を抜き差ししてから、ブラウザ（Chrome / Edge）を再起動する
 3. Windows の場合、RC-S380 が WebUSB で利用可能なドライバー（WinUSB）になっているか確認する
 
+## 読み取りできる情報
+
+- カード識別情報（IDm / PMm / システムコード）
+- 追加情報（カードモード、利用可能システムコード）
+- 交通系履歴（サービスコード `090F`、最大20件）
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
