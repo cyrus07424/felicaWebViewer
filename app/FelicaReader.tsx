@@ -26,6 +26,28 @@ type CardInfo = {
   detectedAt: Date;
 };
 
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  return 'エラーが発生しました';
+}
+
+function toDisplayError(message: string): string {
+  if (
+    message.includes("Failed to execute 'open' on 'USBDevice': Access denied.")
+  ) {
+    return [
+      'RC-S380 へのアクセスが拒否されました。',
+      '他アプリ（NFCポートソフト、カードビューア、e-Tax関連ソフト等）を終了してから再試行してください。',
+      '改善しない場合は RC-S380 を抜き差しし、ブラウザを再起動してください。',
+      'Windows 環境では WebUSB で利用できるドライバー設定（WinUSB）が必要です。',
+    ].join('\n');
+  }
+
+  return message;
+}
+
 function toHex(data: Uint8Array): string {
   return Array.from(data)
     .map((b) => b.toString(16).padStart(2, '0').toUpperCase())
@@ -50,23 +72,40 @@ export default function FelicaReader() {
   const rcs380Ref = useRef<RCS380 | null>(null);
   const scanningRef = useRef(false);
 
+  const shutdownDevice = useCallback(async (rcs380: RCS380) => {
+    let disconnectError: unknown = null;
+    try {
+      await rcs380.disconnect();
+    } catch (err) {
+      disconnectError = err;
+    }
+
+    if (rcs380.device.opened) {
+      await rcs380.device.close();
+    }
+
+    if (disconnectError) {
+      throw disconnectError;
+    }
+  }, []);
+
   const startScanning = useCallback(async (rcs380: RCS380) => {
     scanningRef.current = true;
     setStatus('scanning');
 
     while (scanningRef.current) {
       try {
-        // FeliCa polling command: [len, 0x04, sysHigh, sysLow, requestCode, timeSlot]
+        // FeliCa polling command: [len, 0x00, sysHigh, sysLow, requestCode, timeSlot]
         // requestCode=0x01 → response includes system code
-        const pollingCmd = Uint8Array.of(0x06, 0x04, 0xff, 0xff, 0x01, 0x00);
+        const pollingCmd = Uint8Array.of(0x06, 0x00, 0xff, 0xff, 0x01, 0x00);
         const result: ReceivedPacket = await rcs380.inCommRf(
           pollingCmd,
           POLL_TIMEOUT_S
         );
 
         const data = result.data;
-        // Success response: [len(1), 0x05(1), IDm(8), PMm(8), systemCode(2)] = 20 bytes min
-        if (data.length >= 19 && data[1] === 0x05) {
+        // Polling response: [len(1), 0x01(1), IDm(8), PMm(8), systemCode(2)]
+        if (data.length >= 18 && data[1] === 0x01) {
           const idm = data.slice(2, 10);
           const pmm = data.slice(10, 18);
           const systemCode = data.length >= 20 ? data.slice(18, 20) : null;
@@ -90,12 +129,14 @@ export default function FelicaReader() {
   }, []);
 
   const handleConnect = useCallback(async () => {
+    let connectedReader: RCS380 | null = null;
     try {
       setStatus('connecting');
       setError(null);
       setCard(null);
 
       const rcs380 = await RCS380.connect();
+      connectedReader = rcs380;
       rcs380Ref.current = rcs380;
 
       await rcs380.initDevice();
@@ -103,26 +144,47 @@ export default function FelicaReader() {
 
       await startScanning(rcs380);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : 'エラーが発生しました';
-      setError(message);
+      let cleanupError: unknown = null;
+      if (connectedReader) {
+        try {
+          await shutdownDevice(connectedReader);
+        } catch (cleanupErr) {
+          cleanupError = cleanupErr;
+        }
+      }
+
+      rcs380Ref.current = null;
+      const errorMessage = toDisplayError(getErrorMessage(err));
+      const cleanupMessage = cleanupError
+        ? `\nデバイス解放中にエラー: ${getErrorMessage(cleanupError)}`
+        : '';
+      setError(`${errorMessage}${cleanupMessage}`);
       setStatus('error');
     }
-  }, [startScanning]);
+  }, [shutdownDevice, startScanning]);
 
   const handleDisconnect = useCallback(async () => {
     scanningRef.current = false;
-    try {
-      if (rcs380Ref.current) {
-        await rcs380Ref.current.disconnect();
-      }
-    } finally {
-      rcs380Ref.current = null;
+    const currentReader = rcs380Ref.current;
+    rcs380Ref.current = null;
+
+    if (!currentReader) {
       setStatus('disconnected');
       setCard(null);
       setError(null);
+      return;
     }
-  }, []);
+
+    try {
+      await shutdownDevice(currentReader);
+      setStatus('disconnected');
+      setCard(null);
+      setError(null);
+    } catch (err) {
+      setStatus('error');
+      setError(toDisplayError(getErrorMessage(err)));
+    }
+  }, [shutdownDevice]);
 
   const isConnected = status === 'scanning';
 
@@ -179,6 +241,8 @@ export default function FelicaReader() {
 
           <div className="rounded-xl bg-amber-900/30 border border-amber-600/40 p-3 text-sm text-amber-300">
             ⚠ WebUSB はChrome / Edge などの Chromium 系ブラウザでのみ動作します。
+            <br />
+            ⚠ 「Access denied」が出る場合は、RC-S380 を使用中の他アプリを終了してください。
           </div>
         </section>
 

@@ -26,6 +26,16 @@ NEXT_PUBLIC_GTM_CONTAINER_ID=GTM-XXXXXXX
 
 If this variable is not set, GTM tags are not included.
 
+## RC-S380 接続時のトラブルシューティング
+
+### `Failed to execute 'open' on 'USBDevice': Access denied.` が出る
+
+以下を順に確認してください。
+
+1. RC-S380 を使用している他アプリ（NFCポートソフト、カードビューア、e-Tax関連ソフトなど）を終了する
+2. RC-S380 を抜き差ししてから、ブラウザ（Chrome / Edge）を再起動する
+3. Windows の場合、RC-S380 が WebUSB で利用可能なドライバー（WinUSB）になっているか確認する
+
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
