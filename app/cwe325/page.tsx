@@ -91,7 +91,7 @@ async function pbkdf2Hex(data: string, salt: string): Promise<string> {
     {
       name: 'PBKDF2',
       salt: new TextEncoder().encode(salt),
-      iterations: 100_000,
+      iterations: 600_000,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -309,8 +309,8 @@ export default function Cwe325Demo() {
             </li>
             <li>
               <span className="text-green-600 font-medium">安全な実装</span>:
-              PBKDF2(<em>IDm</em>, <em>ランダムソルト</em>, 100,000回)
-              — ソルトあり
+              PBKDF2(<em>IDm</em>, <em>ランダムソルト</em>, 600,000回)
+              — ソルトあり (OWASP 推奨反復回数)
             </li>
           </ul>
         </section>
@@ -514,7 +514,7 @@ export default function Cwe325Demo() {
                 </tbody>
               </table>
             </div>
-            {idmCount.size < secureEntries.length && (
+            {vulnerableDuplicates.size > 0 && (
               <p className="mt-2 text-xs text-green-600">
                 ✅ 同じ IDm でも、ソルトが異なるためハッシュ値も異なります。
               </p>
