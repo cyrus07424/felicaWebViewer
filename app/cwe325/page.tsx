@@ -58,10 +58,12 @@ export default function Cwe325Demo() {
   const [vulnerableEntries, setVulnerableEntries] = useState<HashEntry[]>([]);
   const [secureEntries, setSecureEntries] = useState<HashEntry[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleAdd = useCallback(async () => {
     if (!password) return;
     setLoading(true);
+    setError(null);
     try {
       const salt = generateSalt();
       const [unsaltedHash, saltedHash] = await Promise.all([
@@ -76,6 +78,12 @@ export default function Cwe325Demo() {
         ...prev,
         { password, salt, hash: saltedHash },
       ]);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'ハッシュ計算中にエラーが発生しました。Web Crypto API が利用可能か確認してください。'
+      );
     } finally {
       setLoading(false);
     }
@@ -87,15 +95,15 @@ export default function Cwe325Demo() {
     setPassword('');
   }, []);
 
-  // Highlight rows where the same password was stored more than once
-  const vulnerableDuplicates = new Set<number>();
-  vulnerableEntries.forEach((a, i) =>
-    vulnerableEntries.forEach((b, j) => {
-      if (i !== j && a.password === b.password) {
-        vulnerableDuplicates.add(i);
-        vulnerableDuplicates.add(j);
-      }
-    })
+  // Highlight rows where the same password was stored more than once — O(n)
+  const passwordCount = new Map<string, number>();
+  for (const entry of vulnerableEntries) {
+    passwordCount.set(entry.password, (passwordCount.get(entry.password) ?? 0) + 1);
+  }
+  const vulnerableDuplicates = new Set<number>(
+    vulnerableEntries
+      .map((entry, i) => ((passwordCount.get(entry.password) ?? 0) > 1 ? i : -1))
+      .filter((i) => i !== -1)
   );
 
   return (
@@ -164,6 +172,13 @@ export default function Cwe325Demo() {
             クリア
           </button>
         </div>
+
+        {/* Error */}
+        {error && (
+          <p className="mb-4 text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
+            ⚠️ {error}
+          </p>
+        )}
 
         {/* Tip: same password */}
         <p className="text-xs text-gray-500 mb-4">
