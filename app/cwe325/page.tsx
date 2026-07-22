@@ -295,10 +295,7 @@ export default function Cwe325Demo() {
                 </tbody>
               </table>
             </div>
-            {secureEntries.filter(
-              (e, i, arr) =>
-                arr.findIndex((a) => a.password === e.password) !== i
-            ).length > 0 && (
+            {passwordCount.size < secureEntries.length && (
               <p className="mt-2 text-xs text-green-600">
                 ✅ 同じパスワードでも、ソルトが異なるためハッシュ値も異なります。
               </p>
