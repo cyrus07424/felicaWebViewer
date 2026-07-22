@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useMemo } from 'react';
 import { RCS380, ReceivedPacket } from 'rc_s380_driver';
 
 // ---- RC-S380 constants (same as FelicaReader) ----
@@ -120,6 +120,7 @@ export default function Cwe325Demo() {
   const rcs380Ref = useRef<RCS380 | null>(null);
   const scanningRef = useRef(false);
   const lastDetectedIdmRef = useRef<string | null>(null);
+  const processingRef = useRef(false);
 
   const [manualIdm, setManualIdm] = useState('');
   const [hashError, setHashError] = useState<string | null>(null);
@@ -172,7 +173,14 @@ export default function Cwe325Demo() {
 
         if (detectedIdm && detectedIdm !== lastDetectedIdmRef.current) {
           lastDetectedIdmRef.current = detectedIdm;
-          await addEntry(detectedIdm);
+          if (!processingRef.current) {
+            processingRef.current = true;
+            try {
+              await addEntry(detectedIdm);
+            } finally {
+              processingRef.current = false;
+            }
+          }
         } else if (!detectedIdm) {
           lastDetectedIdmRef.current = null;
         }
@@ -256,16 +264,19 @@ export default function Cwe325Demo() {
     setSecureEntries([]);
   }, []);
 
-  // O(n) duplicate detection for vulnerable table
-  const idmCount = new Map<string, number>();
-  for (const entry of vulnerableEntries) {
-    idmCount.set(entry.idm, (idmCount.get(entry.idm) ?? 0) + 1);
-  }
-  const vulnerableDuplicates = new Set<number>(
-    vulnerableEntries
-      .map((entry, i) => ((idmCount.get(entry.idm) ?? 0) > 1 ? i : -1))
-      .filter((i) => i !== -1)
-  );
+  // O(n) duplicate detection for vulnerable table — memoized
+  const { idmCount, vulnerableDuplicates } = useMemo(() => {
+    const count = new Map<string, number>();
+    for (const entry of vulnerableEntries) {
+      count.set(entry.idm, (count.get(entry.idm) ?? 0) + 1);
+    }
+    const duplicates = new Set<number>(
+      vulnerableEntries
+        .map((entry, i) => ((count.get(entry.idm) ?? 0) > 1 ? i : -1))
+        .filter((i) => i !== -1)
+    );
+    return { idmCount: count, vulnerableDuplicates: duplicates };
+  }, [vulnerableEntries]);
 
   const isScanning = status === 'scanning';
   const isConnecting = status === 'connecting';
