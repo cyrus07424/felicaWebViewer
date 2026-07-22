@@ -46,7 +46,7 @@ function parsePollingResponse(data: Uint8Array): string | null {
 }
 
 function getErrorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : 'エラーが発生しました';
+  return err instanceof Error ? err.message : 'RC-S380 との通信中にエラーが発生しました';
 }
 
 function toDisplayError(message: string): string {
@@ -141,7 +141,7 @@ export default function Cwe325Demo() {
       setHashError(
         err instanceof Error
           ? err.message
-          : 'ハッシュ計算中にエラーが発生しました。'
+          : 'ハッシュ計算中にエラーが発生しました。SHA-256 または PBKDF2 の処理に失敗しました。Web Crypto API が利用可能か確認してください。'
       );
     }
   }, []);
