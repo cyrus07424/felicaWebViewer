@@ -12,7 +12,7 @@
     "next": "16.4.1",
     "rc_s380_driver": "^1.1.2",
     "react": "^19.2.7",
-    "react-dom": "^19.3.0"
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
