@@ -42,11 +42,11 @@ const POLLING_COMMANDS = [
   Uint8Array.of(0x00, 0xfe, 0x00, 0x01, 0x00),
   Uint8Array.of(0x06, 0x00, 0xfe, 0x00, 0x00, 0x00),
   Uint8Array.of(0x00, 0xfe, 0x00, 0x00, 0x00),
-  // Transit IC cards (Suica / PASMO etc.)
-  Uint8Array.of(0x06, 0x00, 0x88, 0xb4, 0x01, 0x00),
-  Uint8Array.of(0x00, 0x88, 0xb4, 0x01, 0x00),
-  Uint8Array.of(0x06, 0x00, 0x88, 0xb4, 0x00, 0x00),
-  Uint8Array.of(0x00, 0x88, 0xb4, 0x00, 0x00),
+  // Japan Railway Cybernetics Area (Suica / PASMO etc.)
+  Uint8Array.of(0x06, 0x00, 0x00, 0x03, 0x01, 0x00),
+  Uint8Array.of(0x00, 0x00, 0x03, 0x01, 0x00),
+  Uint8Array.of(0x06, 0x00, 0x00, 0x03, 0x00, 0x00),
+  Uint8Array.of(0x00, 0x00, 0x03, 0x00, 0x00),
 ];
 
 type ConnectionStatus =
@@ -65,6 +65,7 @@ type CardInfo = {
   transitHistory?: TransitHistoryEntry[];
   studentCard?: StudentCardInfo;
   openServices?: OpenServiceEntry[];
+  systems?: SystemDump[];
   detectedAt: Date;
 };
 
@@ -92,6 +93,71 @@ type OpenServiceEntry = {
   serviceCode: string;
   blocks: string[];
 };
+
+type DumpKeyVersion = {
+  aesKeyVersion?: string;
+  desKeyVersion?: string;
+};
+
+type DumpService = {
+  serviceCodeRaw: number;
+  code: string;
+  numberRaw: number;
+  number: string;
+  attributesHex: string;
+  attributesDescription?: string;
+  requiresKey: boolean;
+  keyVersion?: DumpKeyVersion;
+};
+
+type DumpServiceGroup = {
+  numberRaw: number;
+  number: string;
+  services: DumpService[];
+  blocks?: string[];
+};
+
+type DumpArea = {
+  areaCodeRaw: number;
+  areaCode: string;
+  endServiceCodeRaw: number;
+  endServiceCode: string;
+  keyVersion?: DumpKeyVersion;
+  children: DumpChild[];
+};
+
+type DumpChild =
+  | {
+      kind: 'area';
+      area: DumpArea;
+    }
+  | {
+      kind: 'serviceGroup';
+      group: DumpServiceGroup;
+    };
+
+type SystemDump = {
+  systemCodeRaw: number;
+  systemCode: string;
+  idm: string;
+  pmm: string;
+  systemKeyVersion?: DumpKeyVersion;
+  systemServices: DumpServiceGroup[];
+  areas: DumpArea[];
+  warnings: string[];
+};
+
+type SearchServiceNode =
+  | {
+      kind: 'service';
+      serviceCode: number;
+    }
+  | {
+      kind: 'area';
+      areaCode: number;
+      endServiceCode: number;
+    }
+  | null;
 
 function getErrorMessage(err: unknown): string {
   if (err instanceof Error) {
@@ -123,11 +189,13 @@ function toHex(data: Uint8Array): string {
 
 function identifySystemCode(code: string): string {
   const map: Record<string, string> = {
-    '88 B4': '交通系ICカード（Suica / PASMO / TOICA 等）',
+    '00 03': '交通系ICカード（Suica / PASMO / TOICA 等）',
     '88 F1': 'Edy（電子マネー）',
-    '00 03': 'FeliCa Lite',
     '80 0B': 'iD',
     '80 4B': 'QUICPay',
+    '80 CD': 'Free Area',
+    'FE 00': 'Common Area',
+    'FE 0F': 'Management Area',
   };
   return map[code] ?? '不明なシステム';
 }
@@ -236,6 +304,17 @@ function toServiceCodeLE(serviceCode: number): [number, number] {
   return [serviceCode & 0xff, (serviceCode >> 8) & 0xff];
 }
 
+function packBlockListElement(blockNumber: number, serviceIndex = 0, accessMode = 0): number[] {
+  if (blockNumber < 0x100) {
+    return [0x80 | ((accessMode & 0x07) << 4) | (serviceIndex & 0x0f), blockNumber & 0xff];
+  }
+  return [
+    ((accessMode & 0x07) << 4) | (serviceIndex & 0x0f),
+    blockNumber & 0xff,
+    (blockNumber >> 8) & 0xff,
+  ];
+}
+
 function decodeText(data: Uint8Array): string {
   try {
     return new TextDecoder('shift-jis').decode(data);
@@ -253,6 +332,95 @@ function normalizeDate8(value: string): string {
 
 function toServiceCodeHex(serviceCode: number): string {
   return serviceCode.toString(16).padStart(4, '0').toUpperCase();
+}
+
+function parseNodeCodeHex(value: string): number | null {
+  const normalized = value.replace(/\s/g, '');
+  if (!/^[0-9A-Fa-f]{4}$/.test(normalized)) {
+    return null;
+  }
+  return Number.parseInt(normalized, 16);
+}
+
+function normalizeKeyVersion(value: number): string | undefined {
+  return value === 0xffff ? undefined : toServiceCodeHex(value);
+}
+
+function describeServiceAttribute(serviceCode: number): string | undefined {
+  const attribute = (serviceCode & 0x3f) >> 1;
+  const suffix = (serviceCode & 0x0001) === 0 ? 'with key' : 'without key';
+  const label = (
+    {
+      0b00100: 'Random read/write',
+      0b00101: 'Random read-only',
+      0b00110: 'Cyclic read/write',
+      0b00111: 'Cyclic read-only',
+      0b01000: 'Purse direct',
+      0b01001: 'Purse cashback/decrement',
+      0b01010: 'Purse decrement',
+      0b01011: 'Purse read-only',
+    } as Record<number, string>
+  )[attribute];
+  return label ? `${label} ${suffix}` : undefined;
+}
+
+function buildServiceDump(serviceCode: number): DumpService {
+  return {
+    serviceCodeRaw: serviceCode,
+    code: toServiceCodeHex(serviceCode),
+    numberRaw: serviceCode >> 6,
+    number: toServiceCodeHex(serviceCode >> 6),
+    attributesHex: `0x${(serviceCode & 0x3f)
+      .toString(16)
+      .padStart(2, '0')
+      .toUpperCase()}`,
+    attributesDescription: describeServiceAttribute(serviceCode),
+    requiresKey: (serviceCode & 0x0001) === 0,
+  };
+}
+
+function appendServiceGroup(groups: DumpServiceGroup[], service: DumpService): void {
+  const existing = groups.find((group) => group.numberRaw === service.numberRaw);
+  if (existing) {
+    existing.services.push(service);
+    return;
+  }
+
+  groups.push({
+    numberRaw: service.numberRaw,
+    number: service.number,
+    services: [service],
+  });
+}
+
+function appendServiceChild(children: DumpChild[], service: DumpService): void {
+  const existing = children.find(
+    (child) => child.kind === 'serviceGroup' && child.group.numberRaw === service.numberRaw
+  );
+  if (existing?.kind === 'serviceGroup') {
+    existing.group.services.push(service);
+    return;
+  }
+
+  children.push({
+    kind: 'serviceGroup',
+    group: {
+      numberRaw: service.numberRaw,
+      number: service.number,
+      services: [service],
+    },
+  });
+}
+
+function buildPollingCommands(systemCode: number): Uint8Array[] {
+  const hi = (systemCode >> 8) & 0xff;
+  const lo = systemCode & 0xff;
+  return [
+    Uint8Array.of(0x06, 0x00, hi, lo, 0x00, 0x00),
+    Uint8Array.of(0x00, hi, lo, 0x00, 0x00),
+    Uint8Array.of(0x06, 0x00, hi, lo, 0x01, 0x00),
+    Uint8Array.of(0x00, hi, lo, 0x01, 0x00),
+  ];
 }
 
 function parseStudentCard(blocks: Uint8Array[]): StudentCardInfo {
@@ -419,6 +587,534 @@ async function readStudentCardInfo(
     return null;
   }
   return parseStudentCard(blocks);
+}
+
+async function pollFelicaSystem(
+  rcs380: RCS380,
+  systemCode: number
+): Promise<CardInfo | null> {
+  for (const pollingCmd of buildPollingCommands(systemCode)) {
+    try {
+      const result = await rcs380.inCommRf(pollingCmd, POLL_TIMEOUT_S);
+      const detected = parsePollingResponse(result.data);
+      if (detected) {
+        return detected;
+      }
+    } catch {
+      // Try next polling variant.
+    }
+  }
+
+  return null;
+}
+
+async function requestSystemCodes(
+  rcs380: RCS380,
+  idmBytes: Uint8Array
+): Promise<number[]> {
+  const result = await rcs380.inCommRf(Uint8Array.of(0x0c, ...idmBytes), POLL_TIMEOUT_S);
+  const payload = findFelicaPayload(result.data, 0x0d, idmBytes);
+  if (!payload || payload.length < 10) {
+    return [];
+  }
+
+  const count = payload[9];
+  const codes: number[] = [];
+  for (let i = 0; i < count; i += 1) {
+    const offset = 10 + i * 2;
+    if (offset + 1 >= payload.length) {
+      break;
+    }
+    codes.push((payload[offset] << 8) | payload[offset + 1]);
+  }
+  return codes;
+}
+
+async function searchServiceNode(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  index: number
+): Promise<SearchServiceNode> {
+  const result = await rcs380.inCommRf(
+    Uint8Array.of(0x0a, ...idmBytes, index & 0xff, (index >> 8) & 0xff),
+    POLL_TIMEOUT_S
+  );
+  const payload = findFelicaPayload(result.data, 0x0b, idmBytes);
+  if (!payload || payload.length < 11) {
+    return null;
+  }
+
+  if (payload.length >= 13) {
+    return {
+      kind: 'area',
+      areaCode: payload[9] | (payload[10] << 8),
+      endServiceCode: payload[11] | (payload[12] << 8),
+    };
+  }
+
+  const serviceCode = payload[9] | (payload[10] << 8);
+  if (serviceCode === 0xffff) {
+    return null;
+  }
+
+  return {
+    kind: 'service',
+    serviceCode,
+  };
+}
+
+async function requestServiceKeyVersionsV2(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  nodeCodes: number[]
+): Promise<Map<number, DumpKeyVersion>> {
+  const result = await rcs380.inCommRf(
+    Uint8Array.of(
+      0x32,
+      ...idmBytes,
+      nodeCodes.length,
+      ...nodeCodes.flatMap((code) => [code & 0xff, (code >> 8) & 0xff])
+    ),
+    POLL_TIMEOUT_S
+  );
+  const payload = findFelicaPayload(result.data, 0x33, idmBytes);
+  if (!payload || payload.length < 13 || payload[9] !== 0x00) {
+    throw new Error('Request Service v2 failed');
+  }
+
+  const cryptoId = payload[11];
+  const count = payload[12];
+  const versions = new Map<number, DumpKeyVersion>();
+  const dualMode = cryptoId === 0x41 || cryptoId === 0x43;
+  const expectedLength = 13 + count * (dualMode ? 4 : 2);
+  if (payload.length < expectedLength) {
+    throw new Error('Request Service v2 response was truncated');
+  }
+
+  for (let i = 0; i < Math.min(count, nodeCodes.length); i += 1) {
+    if (dualMode) {
+      const aesOffset = 13 + i * 2;
+      const desOffset = 13 + count * 2 + i * 2;
+      versions.set(nodeCodes[i], {
+        aesKeyVersion: normalizeKeyVersion(
+          payload[aesOffset] | (payload[aesOffset + 1] << 8)
+        ),
+        desKeyVersion: normalizeKeyVersion(
+          payload[desOffset] | (payload[desOffset + 1] << 8)
+        ),
+      });
+      continue;
+    }
+
+    const offset = 13 + i * 2;
+    versions.set(nodeCodes[i], {
+      desKeyVersion: normalizeKeyVersion(payload[offset] | (payload[offset + 1] << 8)),
+    });
+  }
+
+  return versions;
+}
+
+async function requestServiceKeyVersions(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  nodeCodes: number[]
+): Promise<Map<number, DumpKeyVersion>> {
+  const result = await rcs380.inCommRf(
+    Uint8Array.of(
+      0x02,
+      ...idmBytes,
+      nodeCodes.length,
+      ...nodeCodes.flatMap((code) => [code & 0xff, (code >> 8) & 0xff])
+    ),
+    POLL_TIMEOUT_S
+  );
+  const payload = findFelicaPayload(result.data, 0x03, idmBytes);
+  if (!payload || payload.length < 10) {
+    throw new Error('Request Service failed');
+  }
+
+  const count = payload[9];
+  const versions = new Map<number, DumpKeyVersion>();
+  for (let i = 0; i < Math.min(count, nodeCodes.length); i += 1) {
+    const offset = 10 + i * 2;
+    if (offset + 1 >= payload.length) {
+      break;
+    }
+    versions.set(nodeCodes[i], {
+      desKeyVersion: normalizeKeyVersion(payload[offset] | (payload[offset + 1] << 8)),
+    });
+  }
+  return versions;
+}
+
+async function fetchNodeKeyVersions(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  nodeCodes: number[],
+  warnings: string[]
+): Promise<Map<number, DumpKeyVersion>> {
+  const versions = new Map<number, DumpKeyVersion>();
+
+  for (let i = 0; i < nodeCodes.length; i += 0x20) {
+    const chunk = nodeCodes.slice(i, i + 0x20);
+    try {
+      const chunkVersions = await requestServiceKeyVersionsV2(rcs380, idmBytes, chunk);
+      chunkVersions.forEach((value, key) => {
+        versions.set(key, value);
+      });
+    } catch (v2Error) {
+      warnings.push(getErrorMessage(v2Error));
+      try {
+        const chunkVersions = await requestServiceKeyVersions(rcs380, idmBytes, chunk);
+        chunkVersions.forEach((value, key) => {
+          versions.set(key, value);
+        });
+      } catch (legacyError) {
+        warnings.push(getErrorMessage(legacyError));
+      }
+    }
+  }
+
+  return versions;
+}
+
+function assignGroupKeyVersions(
+  groups: DumpServiceGroup[],
+  versions: Map<number, DumpKeyVersion>
+): void {
+  for (const group of groups) {
+    for (const service of group.services) {
+      const keyVersion = versions.get(service.serviceCodeRaw);
+      if (keyVersion && (keyVersion.aesKeyVersion || keyVersion.desKeyVersion)) {
+        service.keyVersion = keyVersion;
+      }
+    }
+  }
+}
+
+function assignAreaKeyVersions(
+  areas: DumpArea[],
+  versions: Map<number, DumpKeyVersion>
+): void {
+  for (const area of areas) {
+    const keyVersion = versions.get(area.areaCodeRaw);
+    if (keyVersion && (keyVersion.aesKeyVersion || keyVersion.desKeyVersion)) {
+      area.keyVersion = keyVersion;
+    }
+
+    for (const child of area.children) {
+      if (child.kind === 'area') {
+        assignAreaKeyVersions([child.area], versions);
+      } else {
+        assignGroupKeyVersions([child.group], versions);
+      }
+    }
+  }
+}
+
+async function collectAreaDump(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  areaCode: number,
+  endServiceCode: number,
+  startIndex: number,
+  nodeCodes: number[],
+  seenCodes: Set<number>,
+  warnings: string[]
+): Promise<{ area: DumpArea; nextIndex: number }> {
+  if (!seenCodes.has(areaCode)) {
+    seenCodes.add(areaCode);
+    nodeCodes.push(areaCode);
+  }
+
+  let index = startIndex;
+  const children: DumpChild[] = [];
+
+  while (true) {
+    const node = await searchServiceNode(rcs380, idmBytes, index);
+    if (!node) {
+      break;
+    }
+
+    if (node.kind === 'service') {
+      if (node.serviceCode < areaCode || node.serviceCode > endServiceCode) {
+        break;
+      }
+      if (!seenCodes.has(node.serviceCode)) {
+        seenCodes.add(node.serviceCode);
+        nodeCodes.push(node.serviceCode);
+      }
+      appendServiceChild(children, buildServiceDump(node.serviceCode));
+      index += 1;
+      continue;
+    }
+
+    if (node.endServiceCode < node.areaCode) {
+      warnings.push(
+        `Area ${toServiceCodeHex(node.areaCode)} has invalid end ${toServiceCodeHex(
+          node.endServiceCode
+        )}`
+      );
+      break;
+    }
+    if (node.areaCode < areaCode || node.endServiceCode > endServiceCode) {
+      break;
+    }
+
+    const child = await collectAreaDump(
+      rcs380,
+      idmBytes,
+      node.areaCode,
+      node.endServiceCode,
+      index + 1,
+      nodeCodes,
+      seenCodes,
+      warnings
+    );
+    children.push({ kind: 'area', area: child.area });
+    if (child.nextIndex <= index) {
+      warnings.push(`Area traversal stalled at index ${index}`);
+      break;
+    }
+    index = child.nextIndex;
+  }
+
+  return {
+    area: {
+      areaCodeRaw: areaCode,
+      areaCode: toServiceCodeHex(areaCode),
+      endServiceCodeRaw: endServiceCode,
+      endServiceCode: toServiceCodeHex(endServiceCode),
+      children,
+    },
+    nextIndex: index,
+  };
+}
+
+async function collectSystemDump(
+  rcs380: RCS380,
+  systemCode: number
+): Promise<SystemDump> {
+  const polledCard = await pollFelicaSystem(rcs380, systemCode);
+  if (!polledCard) {
+    return {
+      systemCodeRaw: systemCode,
+      systemCode: toServiceCodeHex(systemCode),
+      idm: '取得失敗',
+      pmm: '取得失敗',
+      systemServices: [],
+      areas: [],
+      warnings: [`System ${toServiceCodeHex(systemCode)} could not be activated`],
+    };
+  }
+
+  const idmBytes = parseHexBytes(polledCard.idm);
+  const areas: DumpArea[] = [];
+  const systemServices: DumpServiceGroup[] = [];
+  const warnings: string[] = [];
+  const nodeCodes = [0xffff];
+  const seenCodes = new Set<number>(nodeCodes);
+
+  let index = 0;
+  while (true) {
+    const node = await searchServiceNode(rcs380, idmBytes, index);
+    if (!node) {
+      break;
+    }
+
+    if (node.kind === 'service') {
+      warnings.push(
+        `Service ${toServiceCodeHex(node.serviceCode)} at index ${index} was treated as system-level`
+      );
+      if (!seenCodes.has(node.serviceCode)) {
+        seenCodes.add(node.serviceCode);
+        nodeCodes.push(node.serviceCode);
+      }
+      appendServiceGroup(systemServices, buildServiceDump(node.serviceCode));
+      index += 1;
+      continue;
+    }
+
+    const child = await collectAreaDump(
+      rcs380,
+      idmBytes,
+      node.areaCode,
+      node.endServiceCode,
+      index + 1,
+      nodeCodes,
+      seenCodes,
+      warnings
+    );
+    areas.push(child.area);
+    if (child.nextIndex <= index) {
+      warnings.push(`System traversal stalled at index ${index}`);
+      break;
+    }
+    index = child.nextIndex;
+  }
+
+  const keyVersions = await fetchNodeKeyVersions(rcs380, idmBytes, nodeCodes, warnings);
+  const systemKeyVersion = keyVersions.get(0xffff);
+  assignGroupKeyVersions(systemServices, keyVersions);
+  assignAreaKeyVersions(areas, keyVersions);
+
+  const readResults = new Map<number, string[]>();
+  const plaintextTargets: number[] = [];
+  const seenTargets = new Set<number>();
+
+  const collectTargets = (groups: DumpServiceGroup[]) => {
+    for (const group of groups) {
+      const readable = group.services.find((service) => !service.requiresKey);
+      if (readable && !seenTargets.has(readable.serviceCodeRaw)) {
+        seenTargets.add(readable.serviceCodeRaw);
+        plaintextTargets.push(readable.serviceCodeRaw);
+      }
+    }
+  };
+
+  const walkAreaTargets = (children: DumpChild[]) => {
+    for (const child of children) {
+      if (child.kind === 'area') {
+        walkAreaTargets(child.area.children);
+      } else {
+        collectTargets([child.group]);
+      }
+    }
+  };
+
+  collectTargets(systemServices);
+  for (const area of areas) {
+    walkAreaTargets(area.children);
+  }
+
+  for (const serviceCode of plaintextTargets) {
+    try {
+      const blocks = await readAllServiceBlocks(rcs380, idmBytes, serviceCode);
+      if (blocks.length > 0) {
+        readResults.set(serviceCode, blocks);
+      }
+    } catch (error) {
+      warnings.push(
+        `Read Without Encryption failed for ${toServiceCodeHex(serviceCode)}: ${getErrorMessage(
+          error
+        )}`
+      );
+    }
+  }
+
+  const assignBlocksToGroups = (groups: DumpServiceGroup[]) => {
+    for (const group of groups) {
+      for (const service of group.services) {
+        const blocks = readResults.get(service.serviceCodeRaw);
+        if (blocks) {
+          group.blocks = blocks;
+          break;
+        }
+      }
+    }
+  };
+
+  const assignBlocksToChildren = (children: DumpChild[]) => {
+    for (const child of children) {
+      if (child.kind === 'area') {
+        assignBlocksToChildren(child.area.children);
+      } else {
+        assignBlocksToGroups([child.group]);
+      }
+    }
+  };
+
+  assignBlocksToGroups(systemServices);
+  for (const area of areas) {
+    assignBlocksToChildren(area.children);
+  }
+
+  return {
+    systemCodeRaw: systemCode,
+    systemCode: toServiceCodeHex(systemCode),
+    idm: polledCard.idm,
+    pmm: polledCard.pmm,
+    systemKeyVersion:
+      systemKeyVersion &&
+      (systemKeyVersion.aesKeyVersion || systemKeyVersion.desKeyVersion)
+        ? systemKeyVersion
+        : undefined,
+    systemServices,
+    areas,
+    warnings,
+  };
+}
+
+async function readAllServiceBlocks(
+  rcs380: RCS380,
+  idmBytes: Uint8Array,
+  serviceCode: number
+): Promise<string[]> {
+  const blocks: string[] = [];
+  const [serviceCodeLo, serviceCodeHi] = toServiceCodeLE(serviceCode);
+
+  for (let blockNumber = 0; blockNumber <= 0xffff; blockNumber += 1) {
+    const blockListElement = packBlockListElement(blockNumber);
+    const cmd = Uint8Array.of(
+      0x10,
+      0x06,
+      ...idmBytes,
+      0x01,
+      serviceCodeLo,
+      serviceCodeHi,
+      0x01,
+      ...blockListElement
+    );
+    const result = await rcs380.inCommRf(cmd, POLL_TIMEOUT_S);
+    const payload = findFelicaPayload(result.data, 0x07, idmBytes);
+    if (!payload || payload.length < 12) {
+      break;
+    }
+    if (payload[9] !== 0x00 || payload[10] !== 0x00) {
+      break;
+    }
+
+    const count = payload[11];
+    if (count === 0 || payload.length < 12 + count * 16) {
+      break;
+    }
+
+    for (let i = 0; i < count; i += 1) {
+      const offset = 12 + i * 16;
+      blocks.push(toHex(payload.slice(offset, offset + 16)));
+    }
+
+    if (count > 1) {
+      blockNumber += count - 1;
+    }
+  }
+
+  return blocks;
+}
+
+async function dumpFelicaSystems(
+  rcs380: RCS380,
+  detectedCard: CardInfo,
+  availableSystemCodes?: string[]
+): Promise<SystemDump[]> {
+  const explicitCodes = (availableSystemCodes ?? [])
+    .map(parseNodeCodeHex)
+    .filter((code): code is number => code !== null);
+  const fallbackCode = parseNodeCodeHex(detectedCard.systemCode);
+  const systemCodes = Array.from(
+    new Set(explicitCodes.length > 0 ? explicitCodes : fallbackCode !== null ? [fallbackCode] : [])
+  );
+
+  if (systemCodes.length === 0) {
+    return [];
+  }
+
+  const dumps: SystemDump[] = [];
+  for (const systemCode of systemCodes) {
+    dumps.push(await collectSystemDump(rcs380, systemCode));
+  }
+  return dumps;
 }
 
 function tryParseTypeAUid(data: Uint8Array): Uint8Array | null {
@@ -696,6 +1392,7 @@ export default function FelicaReader() {
           let transitHistory: TransitHistoryEntry[] | undefined;
           let studentCard: StudentCardInfo | undefined;
           let openServices: OpenServiceEntry[] | undefined;
+          let systems: SystemDump[] | undefined;
 
           const isFelicaCard = detectedCard.systemCode !== 'TYPE A';
 
@@ -713,35 +1410,11 @@ export default function FelicaReader() {
             }
 
             try {
-              const systemCodeRequest = Uint8Array.of(0x0c, ...idmBytes);
-              const systemCodeResult = await rcs380.inCommRf(
-                systemCodeRequest,
-                POLL_TIMEOUT_S
-              );
-              const systemCodePayload = findFelicaPayload(
-                systemCodeResult.data,
-                0x0d,
-                idmBytes
-              );
-              if (systemCodePayload && systemCodePayload.length >= 10) {
-                const count = systemCodePayload[9];
-                const codes: string[] = [];
-                for (let i = 0; i < count; i += 1) {
-                  const offset = 10 + i * 2;
-                  if (offset + 1 < systemCodePayload.length) {
-                    codes.push(
-                      toHex(
-                        Uint8Array.of(
-                          systemCodePayload[offset],
-                          systemCodePayload[offset + 1]
-                        )
-                      )
-                    );
-                  }
-                }
-                if (codes.length > 0) {
-                  availableSystemCodes = codes;
-                }
+              const systemCodes = await requestSystemCodes(rcs380, idmBytes);
+              if (systemCodes.length > 0) {
+                availableSystemCodes = systemCodes.map((code) =>
+                  toHex(Uint8Array.of((code >> 8) & 0xff, code & 0xff))
+                );
               }
             } catch {
               // Keep polling even when optional details are unavailable.
@@ -778,6 +1451,19 @@ export default function FelicaReader() {
             } catch {
               // Keep polling even when optional details are unavailable.
             }
+
+            try {
+              const dumpedSystems = await dumpFelicaSystems(
+                rcs380,
+                detectedCard,
+                availableSystemCodes
+              );
+              if (dumpedSystems.length > 0) {
+                systems = dumpedSystems;
+              }
+            } catch {
+              // Keep polling even when dump traversal is unavailable.
+            }
           }
 
           setCard({
@@ -787,6 +1473,7 @@ export default function FelicaReader() {
             transitHistory,
             studentCard,
             openServices,
+            systems,
             detectedAt: new Date(),
           });
         } else {
@@ -1021,6 +1708,73 @@ export default function FelicaReader() {
                   value={card.availableSystemCodes.join(' / ')}
                 />
               )}
+              {card.systems && card.systems.length > 0 && (
+                <div className="rounded-xl bg-slate-900/60 border border-slate-700 px-4 py-3 space-y-3">
+                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wide">
+                    カード内容ダンプ
+                  </p>
+                  <div className="space-y-3">
+                    {card.systems.map((system) => (
+                      <details
+                        key={`${system.systemCode}-${system.idm}`}
+                        className="rounded-lg bg-slate-800/60 border border-slate-700 px-3 py-2"
+                      >
+                        <summary className="cursor-pointer list-none text-sm text-slate-100 font-semibold flex flex-wrap gap-x-3 gap-y-1">
+                          <span>System {system.systemCode}</span>
+                          <span className="text-slate-400 font-normal">
+                            IDm {system.idm}
+                          </span>
+                        </summary>
+                        <div className="mt-3 space-y-3 text-sm">
+                          <div className="space-y-1 text-slate-300">
+                            <p>
+                              PMm:{' '}
+                              <span className="font-mono text-slate-100">{system.pmm}</span>
+                            </p>
+                            {system.systemKeyVersion && (
+                              <p className="text-xs text-slate-400">
+                                システム鍵版: {formatKeyVersion(system.systemKeyVersion)}
+                              </p>
+                            )}
+                          </div>
+                          {system.systemServices.length > 0 && (
+                            <div className="space-y-2">
+                              <p className="text-xs text-slate-400 uppercase tracking-wide">
+                                System-level services
+                              </p>
+                              {system.systemServices.map((group) => (
+                                <ServiceGroupView key={`system-${group.number}`} group={group} />
+                              ))}
+                            </div>
+                          )}
+                          {system.areas.length > 0 && (
+                            <div className="space-y-2">
+                              <p className="text-xs text-slate-400 uppercase tracking-wide">
+                                Areas
+                              </p>
+                              {system.areas.map((area) => (
+                                <AreaView key={`${system.systemCode}-${area.areaCode}`} area={area} />
+                              ))}
+                            </div>
+                          )}
+                          {system.warnings.length > 0 && (
+                            <div className="rounded-lg bg-amber-950/40 border border-amber-700/40 px-3 py-2">
+                              <p className="text-xs text-amber-300 uppercase tracking-wide mb-1">
+                                Warnings
+                              </p>
+                              <ul className="list-disc pl-4 space-y-1 text-xs text-amber-200">
+                                {system.warnings.map((warning, index) => (
+                                  <li key={`${system.systemCode}-${index}`}>{warning}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                </div>
+              )}
               {card.transitHistory && card.transitHistory.length > 0 && (
                 <div className="rounded-xl bg-slate-900/60 border border-slate-700 px-4 py-3 space-y-2">
                   <p className="text-xs font-medium text-slate-400 uppercase tracking-wide">
@@ -1144,6 +1898,74 @@ function CardField({
       </p>
       <p className="font-mono text-base text-slate-100 break-all">{value}</p>
       {note && <p className="text-xs text-slate-500">{note}</p>}
+    </div>
+  );
+}
+
+function formatKeyVersion(keyVersion: DumpKeyVersion): string {
+  return [
+    keyVersion.aesKeyVersion ? `AES ${keyVersion.aesKeyVersion}` : null,
+    keyVersion.desKeyVersion ? `DES ${keyVersion.desKeyVersion}` : null,
+  ]
+    .filter(Boolean)
+    .join(' / ');
+}
+
+function ServiceGroupView({ group }: { group: DumpServiceGroup }) {
+  return (
+    <div className="rounded-lg bg-slate-900/60 border border-slate-700 px-3 py-2 space-y-2">
+      <p className="text-sm font-semibold text-slate-100">
+        Service Number {group.number}
+      </p>
+      <div className="space-y-2">
+        {group.services.map((service) => (
+          <div key={service.code} className="text-xs text-slate-300 space-y-1">
+            <p className="font-mono text-slate-100">
+              {service.code} <span className="text-slate-500">({service.attributesHex})</span>
+            </p>
+            {service.attributesDescription && (
+              <p className="text-slate-400">{service.attributesDescription}</p>
+            )}
+            {service.keyVersion && (
+              <p className="text-slate-500">
+                鍵版: {formatKeyVersion(service.keyVersion)}
+              </p>
+            )}
+          </div>
+        ))}
+      </div>
+      {group.blocks && group.blocks.length > 0 && (
+        <div className="rounded bg-slate-950/70 px-2 py-2 space-y-1">
+          {group.blocks.map((block, index) => (
+            <p key={`${group.number}-${index}`} className="font-mono text-xs text-slate-300 break-all">
+              Block {index}: {block}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AreaView({ area }: { area: DumpArea }) {
+  return (
+    <div className="rounded-lg border border-slate-700 bg-slate-900/40 px-3 py-2 space-y-2">
+      <div className="text-sm text-slate-100">
+        <span className="font-semibold">Area {area.areaCode}</span>
+        <span className="text-slate-500 ml-2">end {area.endServiceCode}</span>
+      </div>
+      {area.keyVersion && (
+        <p className="text-xs text-slate-500">鍵版: {formatKeyVersion(area.keyVersion)}</p>
+      )}
+      <div className="space-y-2">
+        {area.children.map((child, index) =>
+          child.kind === 'area' ? (
+            <AreaView key={`${child.area.areaCode}-${index}`} area={child.area} />
+          ) : (
+            <ServiceGroupView key={`${child.group.number}-${index}`} group={child.group} />
+          )
+        )}
+      </div>
     </div>
   );
 }
